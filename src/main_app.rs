@@ -129,6 +129,19 @@ struct PdfEventResult {
     action: Option<AppAction>,
 }
 
+/// Saved PDF state for deferred restoration after reload
+/// This prevents overwriting state while the render service is still processing
+#[cfg(feature = "pdf")]
+#[derive(Debug, Clone)]
+struct SavedPdfState {
+    page: usize,
+    scroll: u32,
+    zoom: f32,
+    pan: u32,
+    themed: bool,
+    invert: bool,
+}
+
 pub struct App {
     pub book_manager: BookManager,
     pub navigation_panel: NavigationPanel,
@@ -198,9 +211,16 @@ pub struct App {
     #[cfg(feature = "pdf")]
     pdf_supports_scroll_mode: bool,
     last_terminal_title: Option<String>,
+    #[cfg(feature = "pdf")]
     watch_mode: bool,
+    #[cfg(feature = "pdf")]
     file_watch_rx: Option<std::sync::mpsc::Receiver<crate::live_reload::FileChangedEvent>>,
+    #[cfg(feature = "pdf")]
     _file_watcher: Option<notify::RecommendedWatcher>,
+    /// Deferred state restoration pending after PDF reload.
+    /// We defer restoration for one frame to ensure render service is idle.
+    #[cfg(feature = "pdf")]
+    reload_state_pending: Option<SavedPdfState>,
 }
 
 #[cfg(feature = "pdf")]
@@ -536,9 +556,14 @@ impl App {
             #[cfg(feature = "pdf")]
             pdf_supports_scroll_mode: startup_caps.pdf.supports_scroll_mode,
             last_terminal_title: None,
+            #[cfg(feature = "pdf")]
             watch_mode: false,
+            #[cfg(feature = "pdf")]
             file_watch_rx: None,
+            #[cfg(feature = "pdf")]
             _file_watcher: None,
+            #[cfg(feature = "pdf")]
+            reload_state_pending: None,
         };
 
         // Fix incompatible PDF settings (e.g., Scroll mode without Kitty protocol)
@@ -1210,7 +1235,7 @@ impl App {
             service.set_current_page_no_render(initial_page);
             // Kitty zoom is display-only; applying worker scale here would double-apply
             // persisted zoom (render-time scale * display-time zoom).
-            if !use_kitty && (pdf_scale - 1.0).abs() > f32::EPSILON {
+            if !use_kitty && pdf_scale != 1.0 {
                 service.apply_command(crate::pdf::Command::SetScale(pdf_scale));
             }
         }
@@ -1231,18 +1256,28 @@ impl App {
         self.save_bookmark_with_throttle(true);
 
         // Start watching for file changes if in watch mode
+        #[cfg(feature = "pdf")]
         if self.watch_mode {
             let (tx, rx) = std::sync::mpsc::channel();
-            match crate::live_reload::watch_file(&path, tx) {
+            match crate::live_reload::watch_file(path, tx) {
                 Ok(watcher) => {
                     self._file_watcher = Some(watcher);
                     self.file_watch_rx = Some(rx);
-                    log::info!("Started live reload watcher for {}", path);
+                    log::info!("Live reload: watching file for changes: {}", path);
                 }
                 Err(e) => {
-                    log::error!("Failed to start live reload watcher: {}", e);
+                    let context = match e.kind {
+                        notify::ErrorKind::PathNotFound => {
+                            "PDF file path does not exist or cannot be accessed"
+                        }
+                        notify::ErrorKind::Io(_) => {
+                            "I/O error: permission denied or OS limit reached"
+                        }
+                        _ => "file watcher initialization failed (notify backend issue)",
+                    };
+                    log::error!("Live reload failed: {} ({:?})", context, e);
                     self.notifications
-                        .show_warning("Failed to start live reload watcher".to_string());
+                        .show_warning(format!("Live reload unavailable: {}", context));
                 }
             }
         }
@@ -1260,7 +1295,8 @@ impl App {
                 anyhow::bail!("No PDF reader state");
             };
 
-            // Capture user state
+            // Capture current user state before reload
+            // This preserves the user's reading position even if the PDF is regenerated
             let saved_page = pdf_reader.page;
             let saved_scroll = pdf_reader.non_kitty_scroll_offset;
             let saved_zoom = pdf_reader
@@ -1276,37 +1312,61 @@ impl App {
             let saved_themed = pdf_reader.themed_rendering;
             let saved_invert = pdf_reader.invert_images;
 
-            // Force a reload using load_pdf, ignoring persistent bookmarks initially
+            // Force reload while suppressing bookmark restoration
+            // This preserves the current page position rather than jumping to the last-saved bookmark
             self.load_pdf(&path.to_string_lossy(), true)?;
 
-            // Restore user state
+            // Defer state restoration for one frame to allow render service to become idle
+            // This prevents overwriting state while the service is processing old page requests
+            self.reload_state_pending = Some(SavedPdfState {
+                page: saved_page,
+                scroll: saved_scroll,
+                zoom: saved_zoom,
+                pan: saved_pan,
+                themed: saved_themed,
+                invert: saved_invert,
+            });
+
+            self.pending_force_redraw = true;
+        }
+        Ok(())
+    }
+
+    pub fn check_file_reload(&mut self) -> bool {
+        // First, check if we have pending state restoration from a previous reload
+        #[cfg(feature = "pdf")]
+        if let Some(saved_state) = self.reload_state_pending.take() {
             if let Some(new_pdf_reader) = &mut self.pdf_reader {
+                // Now that the PDF is loaded, restore the user's previous state
+                // (page number is clamped to valid range if the new PDF has fewer pages)
                 let total_pages = new_pdf_reader.rendered.len();
-                new_pdf_reader.page = saved_page.min(total_pages.saturating_sub(1));
-                new_pdf_reader.non_kitty_scroll_offset = saved_scroll;
-                new_pdf_reader.themed_rendering = saved_themed;
-                new_pdf_reader.invert_images = saved_invert;
-                
+                new_pdf_reader.page = saved_state.page.min(total_pages.saturating_sub(1));
+                new_pdf_reader.non_kitty_scroll_offset = saved_state.scroll;
+                new_pdf_reader.themed_rendering = saved_state.themed;
+                new_pdf_reader.invert_images = saved_state.invert;
+
                 if new_pdf_reader.is_kitty {
                     if let Some(ref mut zoom) = new_pdf_reader.zoom {
-                        zoom.factor = saved_zoom;
-                        zoom.cell_pan_from_left = saved_pan as u16;
+                        zoom.factor = saved_state.zoom;
+                        zoom.cell_pan_from_left = saved_state.pan as u16;
                     }
                 } else {
-                    new_pdf_reader.non_kitty_zoom_factor = saved_zoom;
-                    new_pdf_reader.non_kitty_pan_offset = saved_pan;
+                    // For non-Kitty terminals, we need to manually reapply zoom settings
+                    // Kitty handles zoom via its own ANSI sequences, so we only restore for traditional terminals
+                    new_pdf_reader.non_kitty_zoom_factor = saved_state.zoom;
+                    new_pdf_reader.non_kitty_pan_offset = saved_state.pan;
                 }
 
                 // Re-apply layout/zoom to the background render service
                 if let Some(ref mut service) = self.pdf_service {
                     service.set_current_page_no_render(new_pdf_reader.page);
-                    if !new_pdf_reader.is_kitty && (saved_zoom - 1.0).abs() > f32::EPSILON {
-                        service.apply_command(crate::pdf::Command::SetScale(saved_zoom));
+                    if !new_pdf_reader.is_kitty && saved_state.zoom != 1.0 {
+                        service.apply_command(crate::pdf::Command::SetScale(saved_state.zoom));
                     }
-                    if !saved_invert {
+                    if !saved_state.invert {
                         service.apply_command(crate::pdf::Command::ToggleInvertImages);
                     }
-                    if !saved_themed {
+                    if !saved_state.themed {
                         service.apply_command(crate::pdf::Command::SetColors {
                             black: -1,
                             white: -1,
@@ -1320,20 +1380,17 @@ impl App {
                 }
             }
             self.pending_force_redraw = true;
+            return true;
         }
-        Ok(())
-    }
 
-    pub fn check_file_reload(&mut self) -> bool {
+        // Then check if there's a new file change event to trigger reload
         let mut reloaded = false;
+        #[cfg(feature = "pdf")]
         if let Some(rx) = &self.file_watch_rx {
             // Drain the channel
-            while let Ok(_) = rx.try_recv() {
-                #[cfg(feature = "pdf")]
-                {
-                    if self.pdf_document_path.is_some() {
-                        reloaded = true;
-                    }
+            while rx.try_recv().is_ok() {
+                if self.pdf_document_path.is_some() {
+                    reloaded = true;
                 }
             }
         }
@@ -3521,6 +3578,7 @@ impl App {
         self.test_mode = enabled;
     }
 
+    #[cfg(feature = "pdf")]
     pub fn set_watch_mode(&mut self, enabled: bool) {
         self.watch_mode = enabled;
     }
