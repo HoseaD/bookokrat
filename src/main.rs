@@ -33,6 +33,7 @@ struct CliArgs {
     file_path: Option<String>,
     zen_mode: bool,
     test_mode: bool,
+    #[cfg(feature = "pdf")]
     watch: bool,
 }
 
@@ -40,15 +41,36 @@ fn parse_args() -> Result<CliArgs> {
     let mut file_path = None;
     let mut zen_mode = false;
     let mut test_mode = false;
+    #[cfg(feature = "pdf")]
     let mut watch = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--zen-mode" => zen_mode = true,
             "--test-mode" => test_mode = true,
+            #[cfg(feature = "pdf")]
             "--watch" | "-w" => watch = true,
             "--help" | "-h" => {
-                println!("Usage: bookokrat [FILE.epub] [--zen-mode] [--test-mode] [--watch]");
+                #[cfg(feature = "pdf")]
+                {
+                    println!("Usage: bookokrat [FILE.pdf|FILE.epub] [OPTIONS]");
+                    println!("\nOPTIONS:");
+                    println!("  --zen-mode            Open in zen mode (hide sidebar)");
+                    println!("  --test-mode           Enable test mode for automation");
+                    println!("  --watch, -w           Watch PDF file for changes and reload");
+                    println!("                        (macOS/Linux: FSEvents/inotify)");
+                    println!("  --help, -h            Show this help message");
+                    println!("  --version, -V         Show version");
+                }
+                #[cfg(not(feature = "pdf"))]
+                {
+                    println!("Usage: bookokrat [FILE.epub] [OPTIONS]");
+                    println!("\nOPTIONS:");
+                    println!("  --zen-mode            Open in zen mode");
+                    println!("  --test-mode           Enable test mode");
+                    println!("  --help, -h            Show this help message");
+                    println!("  --version, -V         Show version");
+                }
                 std::process::exit(0);
             }
             "--version" | "-V" => {
@@ -71,6 +93,7 @@ fn parse_args() -> Result<CliArgs> {
         file_path,
         zen_mode,
         test_mode,
+        #[cfg(feature = "pdf")]
         watch,
     })
 }
@@ -225,6 +248,7 @@ fn main() -> Result<()> {
     );
     app.set_zen_mode(args.zen_mode);
     app.set_test_mode(args.test_mode);
+    #[cfg(feature = "pdf")]
     app.set_watch_mode(args.watch);
     if let Some(path) = args.file_path.as_deref() {
         if let Err(err) = app.open_book_for_reading_by_path(path) {
