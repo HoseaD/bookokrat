@@ -198,6 +198,9 @@ pub struct App {
     #[cfg(feature = "pdf")]
     pdf_supports_scroll_mode: bool,
     last_terminal_title: Option<String>,
+    watch_mode: bool,
+    file_watch_rx: Option<std::sync::mpsc::Receiver<crate::live_reload::FileChangedEvent>>,
+    _file_watcher: Option<notify::RecommendedWatcher>,
 }
 
 #[cfg(feature = "pdf")]
@@ -533,6 +536,9 @@ impl App {
             #[cfg(feature = "pdf")]
             pdf_supports_scroll_mode: startup_caps.pdf.supports_scroll_mode,
             last_terminal_title: None,
+            watch_mode: false,
+            file_watch_rx: None,
+            _file_watcher: None,
         };
 
         // Fix incompatible PDF settings (e.g., Scroll mode without Kitty protocol)
@@ -1224,7 +1230,129 @@ impl App {
         self.switch_to_pdf_toc_mode();
         self.save_bookmark_with_throttle(true);
 
+        // Start watching for file changes if in watch mode
+        if self.watch_mode {
+            let (tx, rx) = std::sync::mpsc::channel();
+            match crate::live_reload::watch_file(&path, tx) {
+                Ok(watcher) => {
+                    self._file_watcher = Some(watcher);
+                    self.file_watch_rx = Some(rx);
+                    log::info!("Started live reload watcher for {}", path);
+                }
+                Err(e) => {
+                    log::error!("Failed to start live reload watcher: {}", e);
+                    self.notifications
+                        .show_warning("Failed to start live reload watcher".to_string());
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    pub fn reload_current_document(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "pdf")]
+        {
+            let Some(path) = self.pdf_document_path.clone() else {
+                anyhow::bail!("No PDF document loaded");
+            };
+            let Some(pdf_reader) = &self.pdf_reader else {
+                anyhow::bail!("No PDF reader state");
+            };
+
+            // Capture user state
+            let saved_page = pdf_reader.page;
+            let saved_scroll = pdf_reader.non_kitty_scroll_offset;
+            let saved_zoom = pdf_reader
+                .zoom
+                .as_ref()
+                .map(|z| z.factor)
+                .unwrap_or(pdf_reader.non_kitty_zoom_factor);
+            let saved_pan = pdf_reader
+                .zoom
+                .as_ref()
+                .map(|z| z.cell_pan_from_left as u32)
+                .unwrap_or(pdf_reader.non_kitty_pan_offset);
+            let saved_themed = pdf_reader.themed_rendering;
+            let saved_invert = pdf_reader.invert_images;
+
+            // Force a reload using load_pdf, ignoring persistent bookmarks initially
+            self.load_pdf(&path.to_string_lossy(), true)?;
+
+            // Restore user state
+            if let Some(new_pdf_reader) = &mut self.pdf_reader {
+                let total_pages = new_pdf_reader.rendered.len();
+                new_pdf_reader.page = saved_page.min(total_pages.saturating_sub(1));
+                new_pdf_reader.non_kitty_scroll_offset = saved_scroll;
+                new_pdf_reader.themed_rendering = saved_themed;
+                new_pdf_reader.invert_images = saved_invert;
+                
+                if new_pdf_reader.is_kitty {
+                    if let Some(ref mut zoom) = new_pdf_reader.zoom {
+                        zoom.factor = saved_zoom;
+                        zoom.cell_pan_from_left = saved_pan as u16;
+                    }
+                } else {
+                    new_pdf_reader.non_kitty_zoom_factor = saved_zoom;
+                    new_pdf_reader.non_kitty_pan_offset = saved_pan;
+                }
+
+                // Re-apply layout/zoom to the background render service
+                if let Some(ref mut service) = self.pdf_service {
+                    service.set_current_page_no_render(new_pdf_reader.page);
+                    if !new_pdf_reader.is_kitty && (saved_zoom - 1.0).abs() > f32::EPSILON {
+                        service.apply_command(crate::pdf::Command::SetScale(saved_zoom));
+                    }
+                    if !saved_invert {
+                        service.apply_command(crate::pdf::Command::ToggleInvertImages);
+                    }
+                    if !saved_themed {
+                        service.apply_command(crate::pdf::Command::SetColors {
+                            black: -1,
+                            white: -1,
+                        });
+                    }
+                }
+                if let Some(cmd_tx) = self.pdf_conversion_tx.as_ref() {
+                    let _ = cmd_tx.send(crate::pdf::ConversionCommand::NavigateTo(
+                        new_pdf_reader.page,
+                    ));
+                }
+            }
+            self.pending_force_redraw = true;
+        }
+        Ok(())
+    }
+
+    pub fn check_file_reload(&mut self) -> bool {
+        let mut reloaded = false;
+        if let Some(rx) = &self.file_watch_rx {
+            // Drain the channel
+            while let Ok(_) = rx.try_recv() {
+                #[cfg(feature = "pdf")]
+                {
+                    if self.pdf_document_path.is_some() {
+                        reloaded = true;
+                    }
+                }
+            }
+        }
+
+        if reloaded {
+            match self.reload_current_document() {
+                Ok(_) => {
+                    self.notifications
+                        .show_info("Document reloaded".to_string());
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Live reload skipped (file not ready?): {e}");
+                    false
+                }
+            }
+        } else {
+            false
+        }
     }
 
     /// Convert palette colors to MuPDF format (0xRRGGBB as i32)
@@ -3391,6 +3519,10 @@ impl App {
 
     pub fn set_test_mode(&mut self, enabled: bool) {
         self.test_mode = enabled;
+    }
+
+    pub fn set_watch_mode(&mut self, enabled: bool) {
+        self.watch_mode = enabled;
     }
 
     /// Check if a key is a global hotkey that should work regardless of focus
@@ -6196,6 +6328,11 @@ where
             if pdf_renders_ready {
                 needs_redraw = true;
             }
+
+            if app.check_file_reload() {
+                needs_redraw = true;
+            }
+
             last_tick = std::time::Instant::now();
         }
 

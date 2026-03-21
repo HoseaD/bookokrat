@@ -14,6 +14,7 @@ pub use vendored::ratatui_image;
 pub mod inputs;
 pub mod jump_list;
 pub mod library;
+pub mod live_reload;
 pub mod main_app;
 pub mod markdown;
 pub mod notification;

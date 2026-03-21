@@ -33,19 +33,22 @@ struct CliArgs {
     file_path: Option<String>,
     zen_mode: bool,
     test_mode: bool,
+    watch: bool,
 }
 
 fn parse_args() -> Result<CliArgs> {
     let mut file_path = None;
     let mut zen_mode = false;
     let mut test_mode = false;
+    let mut watch = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--zen-mode" => zen_mode = true,
             "--test-mode" => test_mode = true,
+            "--watch" | "-w" => watch = true,
             "--help" | "-h" => {
-                println!("Usage: bookokrat [FILE.epub] [--zen-mode] [--test-mode]");
+                println!("Usage: bookokrat [FILE.epub] [--zen-mode] [--test-mode] [--watch]");
                 std::process::exit(0);
             }
             "--version" | "-V" => {
@@ -68,6 +71,7 @@ fn parse_args() -> Result<CliArgs> {
         file_path,
         zen_mode,
         test_mode,
+        watch,
     })
 }
 
@@ -221,6 +225,7 @@ fn main() -> Result<()> {
     );
     app.set_zen_mode(args.zen_mode);
     app.set_test_mode(args.test_mode);
+    app.set_watch_mode(args.watch);
     if let Some(path) = args.file_path.as_deref() {
         if let Err(err) = app.open_book_for_reading_by_path(path) {
             error!("Failed to open requested book: {err}");
