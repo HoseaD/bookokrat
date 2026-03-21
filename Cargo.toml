@@ -84,6 +84,8 @@ thiserror = "1.0.59"
 flate2 = "1.0"
 png = "0.17"
 walkdir = "2.4"
+# File watcher for live reload (--watch flag)
+# Platform-specific: uses FSEvents on macOS, inotify on Linux, ReadDirectoryChangesW on Windows
 notify = { version = "6", features = ["macos_fsevent"] }
 
 # PDF rendering dependencies (optional, enabled with `pdf` feature)
