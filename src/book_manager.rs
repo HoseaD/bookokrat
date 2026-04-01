@@ -100,7 +100,9 @@ impl BookManager {
                     "epub" => Some(BookFormat::Epub),
                     "html" | "htm" => Some(BookFormat::Html),
                     #[cfg(feature = "pdf")]
-                    "pdf" => Some(BookFormat::Pdf),
+                    "pdf" | "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tif" | "tiff" => {
+                        Some(BookFormat::Pdf)
+                    }
                     #[cfg(feature = "pdf")]
                     "djvu" | "djv" => Some(BookFormat::Djvu),
                     _ => None,
@@ -664,7 +666,9 @@ impl BookManager {
             "epub" => Some(BookFormat::Epub),
             "html" | "htm" => Some(BookFormat::Html),
             #[cfg(feature = "pdf")]
-            "pdf" => Some(BookFormat::Pdf),
+            "pdf" | "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tif" | "tiff" => {
+                Some(BookFormat::Pdf)
+            }
             #[cfg(feature = "pdf")]
             "djvu" | "djv" => Some(BookFormat::Djvu),
             _ => None,
